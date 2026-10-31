@@ -10,6 +10,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "check:overview-integration": "node tests/overview-integration-check.mjs",
+    "overview:integration": "node tests/overview-integration-check.mjs",
     "check:portfolio-integration": "node tests/portfolio-integration-check.mjs",
     "check:signals-integration": "node tests/signals-integration-check.mjs"
   },
