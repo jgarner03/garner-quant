@@ -80,6 +80,24 @@ def read_csv(path: Path, required_columns: set[str]) -> list[dict[str, str]]:
     return rows
 
 
+def read_required_fields_csv(path: Path, required_columns: set[str], nullable_columns: frozenset[str] = frozenset()) -> list[dict[str, str]]:
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None or not required_columns.issubset(set(reader.fieldnames)):
+                raise ValueError("unsupported or missing columns")
+            rows = list(reader)
+    except FileNotFoundError as exc:
+        raise ValueError("source file is missing") from exc
+    except csv.Error as exc:
+        raise ValueError("malformed CSV") from exc
+    if not rows:
+        raise ValueError("source file is empty")
+    if any(any(row.get(column) in (None, "") for column in required_columns - nullable_columns) for row in rows):
+        raise ValueError("required source fields contain missing values")
+    return rows
+
+
 def source(name: str, row_count: int, as_of: datetime | None, warning: str | None = None) -> SourceFile:
     classification = "local_snapshot" if warning is None else "unavailable"
     return SourceFile(
@@ -130,6 +148,50 @@ def load_portfolio(path: Path) -> tuple[PortfolioSummary, PerformanceSeries, Sou
         warnings.append(message)
         summary = PortfolioSummary(portfolio_value=None, cash=None, daily_change_percent=None, total_return_percent=None, availability={key: unavailable(message) for key in ("portfolio_value", "cash", "daily_change_percent", "total_return_percent")})
         return summary, PerformanceSeries(availability=unavailable(message)), source(path.name, 0, None, message), warnings
+
+
+def load_trading_performance(data_root: Path) -> tuple[PerformanceSeries, list[str]]:
+    try:
+        ledger = read_required_fields_csv(data_root / "trade_ledger_v1.csv", {"timestamp", "action", "status"})
+        accepted_buys = [parse_datetime(row["timestamp"], "timestamp") for row in ledger if row["status"] == "RECORDED" and row["action"] == "BUY"]
+        if not accepted_buys:
+            raise ValueError("no recorded BUY establishes a trading start")
+        trading_start = min(accepted_buys)
+
+        with (data_root / "accounting_reconciliation_report.json").open("r", encoding="utf-8") as handle:
+            reconciliation = json.load(handle)
+        if not isinstance(reconciliation, dict) or "starting_cash" not in reconciliation:
+            raise ValueError("opening reconciliation has no starting_cash")
+        opening_equity = parse_decimal(str(reconciliation["starting_cash"]), "starting_cash")
+
+        tracker = read_required_fields_csv(data_root / "paper_30_day_tracker.csv", {"date", "portfolio_value"}, frozenset({"portfolio_value"}))
+        in_period = [row for row in tracker if parse_datetime(row["date"], "date") >= trading_start]
+        excluded = sum(1 for row in in_period if row["portfolio_value"] == "")
+        observations = sorted(
+            (parse_datetime(row["date"], "date"), parse_decimal(row["portfolio_value"], "portfolio_value"))
+            for row in in_period
+            if row["portfolio_value"] != ""
+        )
+        if not observations:
+            raise ValueError("no recorded equity observations at or after trading start")
+
+        series = [(trading_start, opening_equity), *[(stamp, equity) for stamp, equity in observations if stamp > trading_start]]
+        peak = opening_equity
+        previous = opening_equity
+        points: list[PerformancePoint] = []
+        for stamp, equity in series:
+            peak = max(peak, equity)
+            daily_return = ((equity / previous) - Decimal("1")) * Decimal("100") if previous != 0 else Decimal("0")
+            drawdown = ((equity / peak) - Decimal("1")) * Decimal("100") if peak != 0 else Decimal("0")
+            points.append(PerformancePoint(as_of_utc=stamp, equity=decimal_text(equity), daily_return_percent=decimal_text(daily_return), drawdown_percent=decimal_text(drawdown)))
+            previous = equity
+        if excluded:
+            message = f"authoritative trading performance: {excluded} tracker row(s) with missing portfolio_value excluded; no values interpolated"
+            return PerformanceSeries(items=points, availability=AvailabilityField(availability="partial", reason=message)), [message]
+        return PerformanceSeries(items=points, availability=available()), []
+    except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+        message = f"authoritative trading performance: {exc}"
+        return PerformanceSeries(availability=unavailable(message)), [message]
 
 
 def load_holdings(path: Path) -> tuple[HoldingSummary, AllocationSummary, SourceFile, list[str]]:
@@ -235,7 +297,8 @@ def load_risk_safety(path: Path) -> tuple[dict[str, SafetyValue], SourceFile, li
 
 
 def build_overview(generated_at: datetime | None = None, data_root: Path = DATA_ROOT, config_root: Path = CONFIG_ROOT) -> OverviewResponse:
-    portfolio, performance, portfolio_source, portfolio_warnings = load_portfolio(data_root / "portfolio_v2.csv")
+    portfolio, _, portfolio_source, portfolio_warnings = load_portfolio(data_root / "portfolio_v2.csv")
+    performance, performance_warnings = load_trading_performance(data_root)
     holdings, allocation, holdings_source, holdings_warnings = load_holdings(data_root / "holdings_report.csv")
     signals, signals_source, signals_warnings = load_signals(data_root / "signal_report_v2.csv")
     runtime_safety, runtime_source, runtime_warnings = load_runtime_safety(config_root / "live_runtime_config.json")
@@ -250,7 +313,7 @@ def build_overview(generated_at: datetime | None = None, data_root: Path = DATA_
     else:
         snapshot_age_seconds = int((generated - source_as_of).total_seconds())
         freshness_status = "stale" if snapshot_age_seconds > FRESHNESS_THRESHOLD_SECONDS else "fresh"
-    warnings = portfolio_warnings + holdings_warnings + signals_warnings + runtime_warnings + risk_warnings
+    warnings = portfolio_warnings + performance_warnings + holdings_warnings + signals_warnings + runtime_warnings + risk_warnings
     sources = [portfolio_source, holdings_source, signals_source, runtime_source, risk_source]
     classification = "local_snapshot" if not warnings else "partial"
     return OverviewResponse(

@@ -9,6 +9,9 @@ services:
       - ./portfolio_v2.csv:/data/snapshots/portfolio_v2.csv:ro
       - ./holdings_report.csv:/data/snapshots/holdings_report.csv:ro
       - ./signal_report_v2.csv:/data/snapshots/signal_report_v2.csv:ro
+      - ./trade_ledger_v1.csv:/data/snapshots/trade_ledger_v1.csv:ro
+      - ./paper_30_day_tracker.csv:/data/snapshots/paper_30_day_tracker.csv:ro
+      - ./data/accounting_reconciliation_report.json:/data/snapshots/accounting_reconciliation_report.json:ro
       - ./runtime/live_runtime_config.json:/data/config/live_runtime_config.json:ro
       - ./risk_engine/risk_config.json:/data/config/risk_config.json:ro
       - ./data/continuous_research/morning_reports:/data/research:ro

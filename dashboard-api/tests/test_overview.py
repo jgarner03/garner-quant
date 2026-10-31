@@ -9,6 +9,8 @@ HOLDINGS = "date,ticker,shares,entry_price,current_price,market_value,unrealised
 SIGNALS = "date,ticker,signal,weight,status\n2026-01-02,BBB,1,0.2,HOLD / BUY\n2026-01-02,AAA,0,0,AVOID / SELL\n"
 CONFIG = '{"mode":"monitor_only","paper_execution_enabled":false}'
 RISK_CONFIG = '{"trading_enabled":false,"limits_approved":false}'
+LEDGER = "timestamp,action,status\n2026-01-02 09:00:00,BUY,RECORDED\n"
+TRACKER = "date,portfolio_value\n2026-01-02 10:00:00,10050\n2026-01-03 10:00:00,10100\n"
 
 
 def write_sources(tmp_path: Path, portfolio: str = PORTFOLIO, holdings: str = HOLDINGS, signals: str = SIGNALS, risk_config: str = RISK_CONFIG) -> tuple[Path, Path]:
@@ -19,6 +21,9 @@ def write_sources(tmp_path: Path, portfolio: str = PORTFOLIO, holdings: str = HO
     (snapshots / "portfolio_v2.csv").write_text(portfolio, encoding="utf-8")
     (snapshots / "holdings_report.csv").write_text(holdings, encoding="utf-8")
     (snapshots / "signal_report_v2.csv").write_text(signals, encoding="utf-8")
+    (snapshots / "trade_ledger_v1.csv").write_text(LEDGER, encoding="utf-8")
+    (snapshots / "paper_30_day_tracker.csv").write_text(TRACKER, encoding="utf-8")
+    (snapshots / "accounting_reconciliation_report.json").write_text('{"starting_cash":10000}', encoding="utf-8")
     (config / "live_runtime_config.json").write_text(CONFIG, encoding="utf-8")
     (config / "risk_config.json").write_text(risk_config, encoding="utf-8")
     return snapshots, config
@@ -41,6 +46,8 @@ def test_valid_response_is_deterministic(tmp_path: Path) -> None:
     assert result.risk_safety_summary.paper_execution_enabled.value == "Disabled"
     assert result.risk_safety_summary.trading_enabled.value == "Disabled"
     assert result.risk_safety_summary.limits_approved.value == "No"
+    assert result.performance_series.items[0].as_of_utc == datetime(2026, 1, 2, 9, tzinfo=UTC)
+    assert result.performance_series.items[0].equity == "10000"
 
 
 def test_stale_snapshot_age_is_deterministic(tmp_path: Path) -> None:
@@ -61,7 +68,15 @@ def test_missing_file_fails_closed(tmp_path: Path) -> None:
 def test_malformed_and_unsupported_csv_fail_closed(tmp_path: Path) -> None:
     snapshots, config = write_sources(tmp_path, portfolio="Date,equity\n2026-01-01,100\n")
     result = build_overview(data_root=snapshots, config_root=config)
+    assert result.portfolio_summary.availability["portfolio_value"].availability == "unavailable"
+
+
+def test_missing_authoritative_performance_source_fails_closed(tmp_path: Path) -> None:
+    snapshots, config = write_sources(tmp_path)
+    (snapshots / "trade_ledger_v1.csv").unlink()
+    result = build_overview(data_root=snapshots, config_root=config)
     assert result.performance_series.availability.availability == "unavailable"
+    assert result.performance_series.items == []
 
 
 def test_duplicate_instrument_fails_closed(tmp_path: Path) -> None:
@@ -97,3 +112,21 @@ def test_missing_or_malformed_risk_configuration_fails_closed(tmp_path: Path) ->
     snapshots, config = write_sources(tmp_path / "wrong-shape", risk_config="[]")
     wrong_shape = build_overview(data_root=snapshots, config_root=config)
     assert wrong_shape.risk_safety_summary.trading_enabled.availability.availability == "unavailable"
+
+
+def test_blank_tracker_equity_is_excluded_and_disclosed(tmp_path: Path) -> None:
+    snapshots, config = write_sources(tmp_path)
+    (snapshots / "paper_30_day_tracker.csv").write_text("date,portfolio_value\n2026-01-02 10:00:00,\n2026-01-03 10:00:00,10100\n", encoding="utf-8")
+    result = build_overview(data_root=snapshots, config_root=config)
+    assert result.performance_series.availability.availability == "partial"
+    assert "1 tracker row(s) with missing portfolio_value excluded" in (result.performance_series.availability.reason or "")
+    assert [point.equity for point in result.performance_series.items] == ["10000", "10100"]
+    assert any("missing portfolio_value excluded" in warning for warning in result.warnings)
+
+
+def test_blank_tracker_date_fails_closed(tmp_path: Path) -> None:
+    snapshots, config = write_sources(tmp_path)
+    (snapshots / "paper_30_day_tracker.csv").write_text("date,portfolio_value\n,10050\n2026-01-03 10:00:00,10100\n", encoding="utf-8")
+    result = build_overview(data_root=snapshots, config_root=config)
+    assert result.performance_series.availability.availability == "unavailable"
+    assert result.performance_series.items == []
